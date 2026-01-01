@@ -1,9 +1,23 @@
+import os
+import threading
+import http.server
+import socketserver
 import mysql.connector
 import secrets
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# Данные подключения
+# --- БЛОК ОБХОДА ОШИБКИ ПОРТОВ RENDER ---
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    handler = http.server.SimpleHTTPRequestHandler
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        httpd.serve_forever()
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
+
+# --- НАСТРОЙКИ ---
 DB_CONFIG = {
     'host': 'server145.cpcontroller.top',
     'user': 'Livpnweb_Dplusmop',
@@ -22,7 +36,7 @@ def get_db():
 def main_menu(user_id):
     kbd = InlineKeyboardMarkup(row_width=1)
     kbd.add(
-        InlineKeyboardButton("🔄 Сменить ссылку (токен)", callback_data="reset_token"),
+        InlineKeyboardButton("🔄 Сменить ссылку", callback_data="reset_token"),
         InlineKeyboardButton("❓ Поддержка", url="https://t.me/LiVPN_Support")
     )
     if user_id == ADMIN_ID:
@@ -37,65 +51,77 @@ async def start(message: types.Message):
     if args:
         cursor.execute("UPDATE users SET telegram_id = %s WHERE token = %s", (message.from_user.id, args))
         db.commit()
-        await message.answer("✅ Аккаунт привязан! VPN разморожен.", reply_markup=main_menu(message.from_user.id))
+        await message.answer("✅ Аккаунт LiVPN привязан!", reply_markup=main_menu(message.from_user.id))
     else:
         cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (message.from_user.id,))
         u = cursor.fetchone()
         if u:
             await message.answer(f"Привет, {u['username']}! 👋", reply_markup=main_menu(message.from_user.id))
         else:
-            await message.answer("❌ Аккаунт не привязан. Получите ссылку на сайте.")
+            await message.answer("❌ Аккаунт не привязан. Используйте кнопку на сайте.")
     db.close()
 
 @dp.callback_query_handler(lambda c: c.data == "admin_panel")
-async def admin_info(callback: types.CallbackQuery):
+async def admin_panel(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    text = (
-        "📊 **Управление LiVPN**\n\n"
-        "🔹 **Чтобы добавить ключ:**\n"
-        "Пришли сообщение в формате:\n"
-        "`Название | vless://ссылка`\n\n"
-        "🔹 **Чтобы продлить юзера:**\n"
-        "Просто напиши число дней."
+    kbd = InlineKeyboardMarkup(row_width=1)
+    kbd.add(
+        InlineKeyboardButton("➕ Добавить ключ", callback_data="add_key_info"),
+        InlineKeyboardButton("🗑️ Список ключей (Удаление)", callback_data="list_keys")
     )
-    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.message.answer("⚙️ Меню администратора\nДля добавления пришли: `Имя | vless://...`", reply_markup=kbd)
     await callback.answer()
 
-@dp.message_handler()
-async def handle_messages(message: types.Message):
+@dp.callback_query_handler(lambda c: c.data == "list_keys")
+async def list_keys(callback: types.CallbackQuery):
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT id, name FROM vless_configs")
+    rows = cursor.fetchall()
+    db.close()
+    kbd = InlineKeyboardMarkup(row_width=1)
+    for r in rows:
+        kbd.add(InlineKeyboardButton(f"❌ {r['name']}", callback_data=f"del_{r['id']}"))
+    await callback.message.edit_text("Нажми на ключ, чтобы удалить его:", reply_markup=kbd)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("del_"))
+async def delete_key(callback: types.CallbackQuery):
+    key_id = callback.data.split("_")[1]
     db = get_db()
     cursor = db.cursor()
-
-    # 1. Логика добавления VLESS ключей (только для админа)
-    if message.from_user.id == ADMIN_ID and "|" in message.text and "vless://" in message.text:
-        try:
-            name, content = message.text.split("|", 1)
-            cursor.execute("INSERT INTO vless_configs (name, content) VALUES (%s, %s)", (name.strip(), content.strip()))
-            db.commit()
-            await message.answer(f"✅ Ключ **{name.strip()}** успешно добавлен в базу!")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка при добавлении: {e}")
-
-    # 2. Логика продления подписки
-    elif message.text.isdigit():
-        days = int(message.text)
-        cursor.execute("UPDATE users SET expiry_date = DATE_ADD(GREATEST(expiry_date, NOW()), INTERVAL %s DAY) WHERE telegram_id = %s", (days, message.from_user.id))
-        db.commit()
-        await message.answer(f"✅ Подписка продлена на {days} дн.!")
-    
+    cursor.execute("DELETE FROM vless_configs WHERE id = %s", (key_id,))
+    db.commit()
     db.close()
+    await callback.answer("✅ Удалено!")
+    await list_keys(callback)
+
+@dp.message_handler()
+async def handle_msg(message: types.Message):
+    if message.from_user.id == ADMIN_ID and "|" in message.text:
+        name, content = message.text.split("|", 1)
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("INSERT INTO vless_configs (name, content) VALUES (%s, %s)", (name.strip(), content.strip()))
+        db.commit()
+        db.close()
+        await message.answer(f"✅ Ключ {name.strip()} добавлен!")
+    elif message.text.isdigit():
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("UPDATE users SET expiry_date = DATE_ADD(GREATEST(expiry_date, NOW()), INTERVAL %s DAY) WHERE telegram_id = %s", (int(message.text), message.from_user.id))
+        db.commit()
+        db.close()
+        await message.answer(f"✅ Продлено на {message.text} дн.!")
 
 @dp.callback_query_handler(lambda c: c.data == "reset_token")
 async def reset_token(callback: types.CallbackQuery):
-    new_token = secrets.token_hex(8)
+    new_t = secrets.token_hex(8)
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("UPDATE users SET token = %s WHERE telegram_id = %s", (new_token, callback.from_user.id))
+    cursor.execute("UPDATE users SET token = %s WHERE telegram_id = %s", (new_t, callback.from_user.id))
     db.commit()
     db.close()
-    
-    new_url = f"http://livpn.webspot.sbs/sub.php?token={new_token}"
-    await callback.message.answer(f"⚠️ **Ссылка обновлена!**\n\nНовая ссылка:\n`{new_url}`", parse_mode="Markdown")
+    await callback.message.answer(f"⚠️ Токен сменен!\nНовая ссылка:\n`http://livpn.webspot.sbs/sub.php?token={new_t}`", parse_mode="Markdown")
     await callback.answer()
 
 if __name__ == '__main__':
