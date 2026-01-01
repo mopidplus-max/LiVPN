@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.contrib.fsm_storage.memory import MemoryPool
+from aiogram.contrib.fsm_storage.memory import MemoryStorage # ИСПРАВЛЕНО
 
 # --- ФИКЦИВНЫЙ СЕРВЕР ДЛЯ RENDER ---
 def run_dummy_server():
@@ -36,7 +36,7 @@ DB_CONFIG = {
 TOKEN = '8239393918:AAGGPBoBE3KBK3KPuwYaH72AE6vdgsXthA8'
 ADMIN_ID = 5017549785 
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot, storage=MemoryPool())
+dp = Dispatcher(bot, storage=MemoryStorage()) # ИСПРАВЛЕНО
 
 def get_db():
     return mysql.connector.connect(**DB_CONFIG)
@@ -70,7 +70,7 @@ async def start(message: types.Message):
     db.close()
 
 # --- АДМИН-ПАНЕЛЬ: СПИСОК ---
-@dp.callback_query_handler(lambda c: c.data == "admin_panel")
+@dp.callback_query_handler(lambda c: c.data == "admin_panel", state="*")
 async def admin_panel(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
     db = get_db()
@@ -81,13 +81,13 @@ async def admin_panel(callback: types.CallbackQuery):
 
     kbd = InlineKeyboardMarkup(row_width=1)
     for cfg in configs:
-        kbd.insert(InlineKeyboardButton(f"🌐 {cfg['name']}", callback_data=f"manage_{cfg['id']}"))
+        kbd.add(InlineKeyboardButton(f"🌐 {cfg['name']}", callback_data=f"manage_{cfg['id']}"))
     kbd.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
     
     await callback.message.edit_text("⚙️ **Управление конфигурациями:**\nВыберите VLESS для редактирования или удаления.", reply_markup=kbd, parse_mode="Markdown")
 
 # --- МЕНЮ КОНКРЕТНОГО КОНФИГА ---
-@dp.callback_query_handler(lambda c: c.data.startswith("manage_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("manage_"), state="*")
 async def manage_config(callback: types.CallbackQuery):
     cfg_id = callback.data.split("_")[1]
     db = get_db()
@@ -95,10 +95,6 @@ async def manage_config(callback: types.CallbackQuery):
     cursor.execute("SELECT * FROM vless_configs WHERE id = %s", (cfg_id,))
     cfg = cursor.fetchone()
     db.close()
-
-    if not cfg:
-        await callback.answer("Ошибка: конфиг не найден.")
-        return
 
     kbd = InlineKeyboardMarkup(row_width=1)
     kbd.add(
@@ -109,8 +105,7 @@ async def manage_config(callback: types.CallbackQuery):
     )
     await callback.message.edit_text(f"🛠️ **Управление: {cfg['name']}**\n\nТекущий VLESS:\n`{cfg['content']}`", reply_markup=kbd, parse_mode="Markdown")
 
-# --- ЛОГИКА УДАЛЕНИЯ ---
-@dp.callback_query_handler(lambda c: c.data.startswith("delconf_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("delconf_"), state="*")
 async def delete_config(callback: types.CallbackQuery):
     cfg_id = callback.data.split("_")[1]
     db = get_db()
@@ -121,8 +116,8 @@ async def delete_config(callback: types.CallbackQuery):
     await callback.answer("✅ Удалено!")
     await admin_panel(callback)
 
-# --- ЛОГИКА РЕДАКТИРОВАНИЯ (FSM) ---
-@dp.callback_query_handler(lambda c: c.data.startswith("editname_"))
+# --- РЕДАКТИРОВАНИЕ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("editname_"), state="*")
 async def edit_name_start(callback: types.CallbackQuery, state: FSMContext):
     cfg_id = callback.data.split("_")[1]
     await state.update_data(cfg_id=cfg_id)
@@ -140,10 +135,8 @@ async def edit_name_save(message: types.Message, state: FSMContext):
     db.close()
     await state.finish()
     await message.answer(f"✅ Название изменено на: {message.text}")
-    # Возврат в админку имитируем через команду
-    await admin_panel_message(message)
 
-@dp.callback_query_handler(lambda c: c.data.startswith("editvless_"))
+@dp.callback_query_handler(lambda c: c.data.startswith("editvless_"), state="*")
 async def edit_vless_start(callback: types.CallbackQuery, state: FSMContext):
     cfg_id = callback.data.split("_")[1]
     await state.update_data(cfg_id=cfg_id)
@@ -161,26 +154,12 @@ async def edit_vless_save(message: types.Message, state: FSMContext):
     db.close()
     await state.finish()
     await message.answer("✅ VLESS ключ обновлен!")
-    await admin_panel_message(message)
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-async def admin_panel_message(message: types.Message):
-    # Повтор логики вызова админки для текстовых сообщений
-    db = get_db()
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id, name FROM vless_configs")
-    configs = cursor.fetchall()
-    db.close()
-    kbd = InlineKeyboardMarkup(row_width=1)
-    for cfg in configs:
-        kbd.insert(InlineKeyboardButton(f"🌐 {cfg['name']}", callback_data=f"manage_{cfg['id']}"))
-    await message.answer("⚙️ Меню управления:", reply_markup=kbd)
-
-@dp.callback_query_handler(lambda c: c.data == "back_to_main")
+@dp.callback_query_handler(lambda c: c.data == "back_to_main", state="*")
 async def back_to_main(callback: types.CallbackQuery):
     await callback.message.edit_text(f"Привет! 👋", reply_markup=main_menu(callback.from_user.id))
 
-@dp.callback_query_handler(lambda c: c.data == "reset_token")
+@dp.callback_query_handler(lambda c: c.data == "reset_token", state="*")
 async def reset_token_logic(callback: types.CallbackQuery):
     new_t = secrets.token_hex(8)
     db = get_db()
