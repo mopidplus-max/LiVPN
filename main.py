@@ -6,8 +6,11 @@ import mysql.connector
 import secrets
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryPool
 
-# --- БЛОК ОБХОДА ОШИБКИ ПОРТОВ RENDER ---
+# --- ФИКЦИВНЫЙ СЕРВЕР ДЛЯ RENDER ---
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
     handler = http.server.SimpleHTTPRequestHandler
@@ -16,6 +19,11 @@ def run_dummy_server():
         httpd.serve_forever()
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
+
+# --- СОСТОЯНИЯ ДЛЯ РЕДАКТИРОВАНИЯ ---
+class EditState(StatesGroup):
+    edit_name = State()
+    edit_vless = State()
 
 # --- НАСТРОЙКИ ---
 DB_CONFIG = {
@@ -28,7 +36,7 @@ DB_CONFIG = {
 TOKEN = '8239393918:AAGGPBoBE3KBK3KPuwYaH72AE6vdgsXthA8'
 ADMIN_ID = 5017549785 
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=MemoryPool())
 
 def get_db():
     return mysql.connector.connect(**DB_CONFIG)
@@ -51,77 +59,137 @@ async def start(message: types.Message):
     if args:
         cursor.execute("UPDATE users SET telegram_id = %s WHERE token = %s", (message.from_user.id, args))
         db.commit()
-        await message.answer("✅ Аккаунт LiVPN привязан!", reply_markup=main_menu(message.from_user.id))
+        await message.answer("✅ Аккаунт привязан! VPN разморожен.", reply_markup=main_menu(message.from_user.id))
     else:
         cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (message.from_user.id,))
         u = cursor.fetchone()
         if u:
             await message.answer(f"Привет, {u['username']}! 👋", reply_markup=main_menu(message.from_user.id))
         else:
-            await message.answer("❌ Аккаунт не привязан. Используйте кнопку на сайте.")
+            await message.answer("❌ Аккаунт не привязан. Сделайте это на сайте.")
     db.close()
 
+# --- АДМИН-ПАНЕЛЬ: СПИСОК ---
 @dp.callback_query_handler(lambda c: c.data == "admin_panel")
 async def admin_panel(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    kbd = InlineKeyboardMarkup(row_width=1)
-    kbd.add(
-        InlineKeyboardButton("➕ Добавить ключ", callback_data="add_key_info"),
-        InlineKeyboardButton("🗑️ Список ключей (Удаление)", callback_data="list_keys")
-    )
-    await callback.message.answer("⚙️ Меню администратора\nДля добавления пришли: `Имя | vless://...`", reply_markup=kbd)
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "list_keys")
-async def list_keys(callback: types.CallbackQuery):
     db = get_db()
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT id, name FROM vless_configs")
-    rows = cursor.fetchall()
+    configs = cursor.fetchall()
     db.close()
-    kbd = InlineKeyboardMarkup(row_width=1)
-    for r in rows:
-        kbd.add(InlineKeyboardButton(f"❌ {r['name']}", callback_data=f"del_{r['id']}"))
-    await callback.message.edit_text("Нажми на ключ, чтобы удалить его:", reply_markup=kbd)
 
-@dp.callback_query_handler(lambda c: c.data.startswith("del_"))
-async def delete_key(callback: types.CallbackQuery):
-    key_id = callback.data.split("_")[1]
+    kbd = InlineKeyboardMarkup(row_width=1)
+    for cfg in configs:
+        kbd.insert(InlineKeyboardButton(f"🌐 {cfg['name']}", callback_data=f"manage_{cfg['id']}"))
+    kbd.add(InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main"))
+    
+    await callback.message.edit_text("⚙️ **Управление конфигурациями:**\nВыберите VLESS для редактирования или удаления.", reply_markup=kbd, parse_mode="Markdown")
+
+# --- МЕНЮ КОНКРЕТНОГО КОНФИГА ---
+@dp.callback_query_handler(lambda c: c.data.startswith("manage_"))
+async def manage_config(callback: types.CallbackQuery):
+    cfg_id = callback.data.split("_")[1]
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM vless_configs WHERE id = %s", (cfg_id,))
+    cfg = cursor.fetchone()
+    db.close()
+
+    if not cfg:
+        await callback.answer("Ошибка: конфиг не найден.")
+        return
+
+    kbd = InlineKeyboardMarkup(row_width=1)
+    kbd.add(
+        InlineKeyboardButton("📝 Редактировать название", callback_data=f"editname_{cfg_id}"),
+        InlineKeyboardButton("🔗 Редактировать VLESS", callback_data=f"editvless_{cfg_id}"),
+        InlineKeyboardButton("🗑️ УДАЛИТЬ КОНФИГ", callback_data=f"delconf_{cfg_id}"),
+        InlineKeyboardButton("⬅️ НАЗАД", callback_data="admin_panel")
+    )
+    await callback.message.edit_text(f"🛠️ **Управление: {cfg['name']}**\n\nТекущий VLESS:\n`{cfg['content']}`", reply_markup=kbd, parse_mode="Markdown")
+
+# --- ЛОГИКА УДАЛЕНИЯ ---
+@dp.callback_query_handler(lambda c: c.data.startswith("delconf_"))
+async def delete_config(callback: types.CallbackQuery):
+    cfg_id = callback.data.split("_")[1]
     db = get_db()
     cursor = db.cursor()
-    cursor.execute("DELETE FROM vless_configs WHERE id = %s", (key_id,))
+    cursor.execute("DELETE FROM vless_configs WHERE id = %s", (cfg_id,))
     db.commit()
     db.close()
     await callback.answer("✅ Удалено!")
-    await list_keys(callback)
+    await admin_panel(callback)
 
-@dp.message_handler()
-async def handle_msg(message: types.Message):
-    if message.from_user.id == ADMIN_ID and "|" in message.text:
-        name, content = message.text.split("|", 1)
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("INSERT INTO vless_configs (name, content) VALUES (%s, %s)", (name.strip(), content.strip()))
-        db.commit()
-        db.close()
-        await message.answer(f"✅ Ключ {name.strip()} добавлен!")
-    elif message.text.isdigit():
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("UPDATE users SET expiry_date = DATE_ADD(GREATEST(expiry_date, NOW()), INTERVAL %s DAY) WHERE telegram_id = %s", (int(message.text), message.from_user.id))
-        db.commit()
-        db.close()
-        await message.answer(f"✅ Продлено на {message.text} дн.!")
+# --- ЛОГИКА РЕДАКТИРОВАНИЯ (FSM) ---
+@dp.callback_query_handler(lambda c: c.data.startswith("editname_"))
+async def edit_name_start(callback: types.CallbackQuery, state: FSMContext):
+    cfg_id = callback.data.split("_")[1]
+    await state.update_data(cfg_id=cfg_id)
+    await EditState.edit_name.set()
+    await callback.message.answer("Введите новое название для конфига:")
+    await callback.answer()
+
+@dp.message_handler(state=EditState.edit_name)
+async def edit_name_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("UPDATE vless_configs SET name = %s WHERE id = %s", (message.text, data['cfg_id']))
+    db.commit()
+    db.close()
+    await state.finish()
+    await message.answer(f"✅ Название изменено на: {message.text}")
+    # Возврат в админку имитируем через команду
+    await admin_panel_message(message)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("editvless_"))
+async def edit_vless_start(callback: types.CallbackQuery, state: FSMContext):
+    cfg_id = callback.data.split("_")[1]
+    await state.update_data(cfg_id=cfg_id)
+    await EditState.edit_vless.set()
+    await callback.message.answer("Пришлите новый VLESS ключ:")
+    await callback.answer()
+
+@dp.message_handler(state=EditState.edit_vless)
+async def edit_vless_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("UPDATE vless_configs SET content = %s WHERE id = %s", (message.text, data['cfg_id']))
+    db.commit()
+    db.close()
+    await state.finish()
+    await message.answer("✅ VLESS ключ обновлен!")
+    await admin_panel_message(message)
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+async def admin_panel_message(message: types.Message):
+    # Повтор логики вызова админки для текстовых сообщений
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT id, name FROM vless_configs")
+    configs = cursor.fetchall()
+    db.close()
+    kbd = InlineKeyboardMarkup(row_width=1)
+    for cfg in configs:
+        kbd.insert(InlineKeyboardButton(f"🌐 {cfg['name']}", callback_data=f"manage_{cfg['id']}"))
+    await message.answer("⚙️ Меню управления:", reply_markup=kbd)
+
+@dp.callback_query_handler(lambda c: c.data == "back_to_main")
+async def back_to_main(callback: types.CallbackQuery):
+    await callback.message.edit_text(f"Привет! 👋", reply_markup=main_menu(callback.from_user.id))
 
 @dp.callback_query_handler(lambda c: c.data == "reset_token")
-async def reset_token(callback: types.CallbackQuery):
+async def reset_token_logic(callback: types.CallbackQuery):
     new_t = secrets.token_hex(8)
     db = get_db()
     cursor = db.cursor()
     cursor.execute("UPDATE users SET token = %s WHERE telegram_id = %s", (new_t, callback.from_user.id))
     db.commit()
     db.close()
-    await callback.message.answer(f"⚠️ Токен сменен!\nНовая ссылка:\n`http://livpn.webspot.sbs/sub.php?token={new_t}`", parse_mode="Markdown")
+    url = f"http://livpn.webspot.sbs/sub.php?token={new_t}"
+    await callback.message.answer(f"⚠️ Токен обновлен!\nНовая ссылка:\n`{url}`", parse_mode="Markdown")
     await callback.answer()
 
 if __name__ == '__main__':
